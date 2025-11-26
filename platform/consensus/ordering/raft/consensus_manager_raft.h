@@ -58,6 +58,8 @@ class ConsensusManagerRaft : public ConsensusManager {
 
   int ConsensusCommit(std::unique_ptr<Context> context,
                       std::unique_ptr<Request> request) override;
+  int Dispatch(std::unique_ptr<Context> context,
+               std::unique_ptr<Request> request) override;
 
   std::vector<ReplicaInfo> GetReplicas() override;
   uint32_t GetPrimary() override;
@@ -89,6 +91,9 @@ class ConsensusManagerRaft : public ConsensusManager {
   RaftRpc* GetRpc() { return raft_rpc_.get(); }
 
  private:
+  // Helper to get a short-connection ReplicaCommunicator for RAFT RPCs.
+  std::unique_ptr<ReplicaCommunicator> GetShortConnClient();
+
   int HandleClientRequest(std::unique_ptr<Context> context,
                           std::unique_ptr<Request> request);
   int HandleCustomQuery(std::unique_ptr<Context> context,
@@ -117,6 +122,7 @@ class ConsensusManagerRaft : public ConsensusManager {
   std::unique_ptr<RaftLog> raft_log_;
   std::unique_ptr<RaftPersistentState> persistent_state_;
   std::unique_ptr<RaftSnapshotManager> snapshot_manager_;
+  std::unique_ptr<ReplicaCommunicator> raft_rpc_client_;
   std::unique_ptr<RaftRpc> raft_rpc_;
   std::unique_ptr<RaftNode> raft_node_;
 };

@@ -188,7 +188,8 @@ const ReplicaInfo& replica_info) {
     single_bq_[std::make_pair(ip, port)]->Push(std::move(item));
     return 0;
   } else {
-    return SendMessageInternal(message, replicas_);
+    // Short-connection path should only send to the specified replica.
+    return SendMessageInternal(message, {replica_info});
   }
 }
 
@@ -248,13 +249,16 @@ int ReplicaCommunicator::SendMessageFromPool(
   for (const auto& replica : replicas) {
     auto client = GetClientFromPool(replica.ip(), replica.port());
     if (client == nullptr) {
+      LOG(ERROR) << "send to:" << replica.ip() << ":" << replica.port()
+                 << " fail: no client";
       continue;
     }
     //LOG(ERROR) << "send to:" << replica.ip();
     if (client->SendMessage(data) == 0) {
       ret++;
     } else {
-      LOG(ERROR) << "send to:" << replica.ip() << " fail";
+      LOG(ERROR) << "send to:" << replica.ip() << ":" << replica.port()
+                 << " fail";
     }
     //LOG(ERROR) << "send to:" << replica.ip()<<" done";
   }
@@ -275,6 +279,9 @@ int ReplicaCommunicator::SendMessageInternal(
     }
     if (client->SendRawMessage(message) == 0) {
       ret++;
+    } else {
+      LOG(ERROR) << "send to:" << replica.ip() << ":" << replica.port()
+                 << " fail";
     }
   }
   return ret;

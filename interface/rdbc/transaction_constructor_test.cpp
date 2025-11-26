@@ -33,6 +33,7 @@ namespace {
 using ::resdb::testing::EqualsProto;
 using ::testing::_;
 using ::testing::Invoke;
+using ::testing::InSequence;
 using ::testing::Return;
 using ::testing::Test;
 
@@ -68,18 +69,29 @@ class UserClientTest : public Test {
     dest_info_.set_port(1235);
     replicas_.push_back(dest_info_);
 
+    backup_info_.set_ip("127.0.0.1");
+    backup_info_.set_port(2235);
+    replicas_with_backup_ = replicas_;
+    replicas_with_backup_.push_back(backup_info_);
+
     KeyInfo private_key;
     private_key.set_key("private_key");
     config_ = std::make_unique<ResDBConfig>(replicas_, self_info_, private_key,
                                             CertificateInfo());
     config_->SetClientTimeoutMs(10000);
+    config_with_backup_ = std::make_unique<ResDBConfig>(
+        replicas_with_backup_, self_info_, private_key, CertificateInfo());
+    config_with_backup_->SetClientTimeoutMs(10000);
   }
 
  protected:
   ReplicaInfo dest_info_;
+  ReplicaInfo backup_info_;
   ReplicaInfo self_info_;
   std::vector<ReplicaInfo> replicas_;
+  std::vector<ReplicaInfo> replicas_with_backup_;
   std::unique_ptr<ResDBConfig> config_;
+  std::unique_ptr<ResDBConfig> config_with_backup_;
 };
 
 TEST_F(UserClientTest, OnlySendRequestOK) {
@@ -153,6 +165,46 @@ TEST_F(UserClientTest, RecvResponseFail) {
   EXPECT_NE(client.SendRequest(client_request, &client_response,
                                Request::TYPE_CLIENT_REQUEST),
             0);
+}
+
+TEST_F(UserClientTest, RetryNextReplicaOnRecvFail) {
+  ClientTestRequest client_request;
+  client_request.set_value("test_value");
+
+  ClientTestResponse client_response, expected_response;
+  expected_response.set_value("ack");
+
+  std::unique_ptr<MockSocket> socket = std::make_unique<MockSocket>();
+  {
+    InSequence seq;
+    EXPECT_CALL(*socket, Connect(dest_info_.ip(), dest_info_.port()))
+        .WillOnce(Return(0));
+    EXPECT_CALL(*socket, Send(GenerateRequestData(client_request, true)))
+        .WillOnce(Return(0));
+    EXPECT_CALL(*socket, Recv(_, _)).WillOnce(Return(-1));
+    EXPECT_CALL(*socket, Close()).Times(1);
+    EXPECT_CALL(*socket, Connect(backup_info_.ip(), backup_info_.port()))
+        .WillOnce(Return(0));
+    EXPECT_CALL(*socket, Send(GenerateRequestData(client_request, true)))
+        .WillOnce(Return(0));
+    EXPECT_CALL(*socket, Recv(_, _))
+        .WillOnce(Invoke([&](void** buf, size_t* len) {
+          ClientTestResponse response;
+          response.set_value("ack");
+          std::string resp_str = GenerateResponseData(response);
+          *len = resp_str.size();
+          *buf = malloc(*len);
+          memcpy(*buf, resp_str.c_str(), *len);
+          return *len;
+        }));
+  }
+
+  TransactionConstructor client(*config_with_backup_);
+  client.SetSocket(std::move(socket));
+  EXPECT_EQ(client.SendRequest(client_request, &client_response,
+                               Request::TYPE_CLIENT_REQUEST),
+            0);
+  EXPECT_THAT(client_response, EqualsProto(expected_response));
 }
 
 }  // namespace

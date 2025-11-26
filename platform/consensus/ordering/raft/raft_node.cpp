@@ -32,8 +32,10 @@
 namespace resdb {
 
 namespace {
-constexpr std::chrono::milliseconds kMinElectionTimeout(300);
-constexpr std::chrono::milliseconds kMaxElectionTimeout(600);
+// Election needs to comfortably exceed heartbeat cadence. Use a wider window to
+// avoid premature timeouts on busy systems.
+constexpr std::chrono::milliseconds kMinElectionTimeout(12000);
+constexpr std::chrono::milliseconds kMaxElectionTimeout(20000);
 constexpr size_t kMaxEntriesPerAppend = 8;
 }  // namespace
 
@@ -57,6 +59,17 @@ RaftNode::RaftNode(const ResDBConfig& config, ConsensusManagerRaft* manager,
   voted_for_ = persistent_state_ ? persistent_state_->VotedFor() : 0;
   commit_index_ = persistent_state_ ? persistent_state_->CommitIndex() : 0;
   last_applied_ = persistent_state_ ? persistent_state_->LastApplied() : 0;
+  LOG(ERROR) << "[RAFT] node " << self_id_
+             << " init term=" << current_term_
+             << " voted_for=" << voted_for_
+             << " commit_index=" << commit_index_
+             << " last_applied=" << last_applied_;
+  // Seed election RNG per node to avoid synchronized timeouts across replicas.
+  std::seed_seq seed{
+      static_cast<uint32_t>(std::random_device{}()),
+      static_cast<uint32_t>(self_id_),
+      static_cast<uint32_t>(self_id_ << 16)};
+  election_rng_.seed(seed);
   ResetElectionDeadline();
 }
 
@@ -120,6 +133,8 @@ int RaftNode::HandleConsensusMessage(std::unique_ptr<Context> context,
     case raft::RAFT_APPEND_ENTRIES_RESPONSE: {
       raft::AppendEntriesResponse rpc;
       if (!rpc.ParseFromString(request->data())) {
+        LOG(ERROR) << "[RAFT] node " << self_id_
+                   << " failed to parse AppendEntriesResponse";
         return -1;
       }
       return HandleAppendEntriesResponse(rpc);
@@ -127,6 +142,8 @@ int RaftNode::HandleConsensusMessage(std::unique_ptr<Context> context,
     case raft::RAFT_REQUEST_VOTE_REQUEST: {
       raft::RequestVoteRequest rpc;
       if (!rpc.ParseFromString(request->data())) {
+        LOG(ERROR) << "[RAFT] node " << self_id_
+                   << " failed to parse RequestVoteRequest";
         return -1;
       }
       return HandleRequestVoteRequest(*request, rpc);
@@ -134,6 +151,8 @@ int RaftNode::HandleConsensusMessage(std::unique_ptr<Context> context,
     case raft::RAFT_REQUEST_VOTE_RESPONSE: {
       raft::RequestVoteResponse rpc;
       if (!rpc.ParseFromString(request->data())) {
+        LOG(ERROR) << "[RAFT] node " << self_id_
+                   << " failed to parse RequestVoteResponse";
         return -1;
       }
       return HandleRequestVoteResponse(rpc);
@@ -153,8 +172,14 @@ int RaftNode::HandleConsensusMessage(std::unique_ptr<Context> context,
 void RaftNode::RunElectionLoop() {
   while (!stop_) {
     std::unique_lock<std::mutex> lk(election_mutex_);
-    if (election_cv_.wait_until(lk, next_election_deadline_,
-                                [&]() { return stop_.load(); })) {
+    election_cv_.wait_until(lk, next_election_deadline_,
+                            [&]() { return stop_.load(); });
+    if (stop_) {
+      continue;
+    }
+    // If the deadline was moved forward while waiting, skip this round and
+    // wait again using the new deadline.
+    if (std::chrono::steady_clock::now() < next_election_deadline_) {
       continue;
     }
     lk.unlock();
@@ -164,12 +189,25 @@ void RaftNode::RunElectionLoop() {
 
 void RaftNode::ResetElectionDeadline() {
   std::lock_guard<std::mutex> lk(election_mutex_);
-  static thread_local std::mt19937 rng(std::random_device{}());
-  std::uniform_int_distribution<int> dist(
-      0, static_cast<int>((kMaxElectionTimeout - kMinElectionTimeout).count()));
+  // Stagger timeouts per node id to reduce simultaneous candidacy. Bias node 1
+  // with a shorter randomized window; others use a larger randomized window.
+  std::chrono::milliseconds base_min;
+  std::chrono::milliseconds base_max;
+  if (self_id_ == 1) {
+    base_min = std::chrono::milliseconds(2500);
+    base_max = std::chrono::milliseconds(5000);
+  } else {
+    base_min = kMinElectionTimeout +
+               std::chrono::milliseconds(3000 * static_cast<int>(self_id_));
+    base_max = kMaxElectionTimeout +
+               std::chrono::milliseconds(3000 * static_cast<int>(self_id_));
+  }
+  auto span_ms =
+      static_cast<int>(std::max<int64_t>((base_max - base_min).count(), 1));
+  std::uniform_int_distribution<int> dist(0, span_ms);
   next_election_deadline_ =
-      std::chrono::steady_clock::now() + kMinElectionTimeout +
-      std::chrono::milliseconds(dist(rng));
+      std::chrono::steady_clock::now() + base_min +
+      std::chrono::milliseconds(dist(election_rng_));
   election_cv_.notify_all();
 }
 
@@ -189,6 +227,8 @@ void RaftNode::StartElection() {
   vote_record_.clear();
   vote_record_[self_id_] = true;
   PersistTermAndVote();
+  LOG(ERROR) << "[RAFT] node " << self_id_ << " starts election term="
+             << current_term_;
 
   raft::RequestVoteRequest rpc;
   rpc.set_term(current_term_);
@@ -213,6 +253,11 @@ void RaftNode::StartElection() {
 }
 
 void RaftNode::BecomeFollower(uint64_t term, uint32_t leader_id) {
+  if (role_ != Role::kFollower) {
+    LOG(ERROR) << "[RAFT] node " << self_id_ << " role change "
+               << static_cast<int>(role_) << " -> follower term=" << term
+               << " leader=" << leader_id;
+  }
   role_ = Role::kFollower;
   leader_id_ = leader_id;
   if (term > current_term_) {
@@ -221,10 +266,22 @@ void RaftNode::BecomeFollower(uint64_t term, uint32_t leader_id) {
     PersistTermAndVote();
   }
   manager_->UpdateLeadership(leader_id_, current_term_);
+  // Reset backoff when we learn of a leader.
+  if (leader_id != 0) {
+    std::lock_guard<std::mutex> el(election_mutex_);
+    election_backoff_steps_ = 0;
+  }
   ResetElectionDeadline();
+  LOG(ERROR) << "[RAFT] node " << self_id_ << " becomes follower term="
+             << current_term_ << " leader=" << leader_id_;
 }
 
 void RaftNode::BecomeCandidate() {
+  if (role_ != Role::kCandidate) {
+    LOG(ERROR) << "[RAFT] node " << self_id_ << " role change "
+               << static_cast<int>(role_) << " -> candidate term="
+               << current_term_;
+  }
   role_ = Role::kCandidate;
   leader_id_ = 0;
   manager_->UpdateLeadership(0, current_term_);
@@ -232,8 +289,15 @@ void RaftNode::BecomeCandidate() {
 }
 
 void RaftNode::BecomeLeader() {
+  if (role_ != Role::kLeader) {
+    LOG(ERROR) << "[RAFT] node " << self_id_ << " role change "
+               << static_cast<int>(role_) << " -> leader term="
+               << current_term_;
+  }
   role_ = Role::kLeader;
   leader_id_ = self_id_;
+  // Persist our term/vote as leader so we don't fall back to term 0 on restart.
+  PersistTermAndVote();
   manager_->UpdateLeadership(self_id_, current_term_);
   uint64_t next = raft_log_->LastLogIndex() + 1;
   for (const auto& replica : replicas_) {
@@ -243,18 +307,34 @@ void RaftNode::BecomeLeader() {
   match_index_[self_id_] = raft_log_->LastLogIndex();
   next_index_[self_id_] = next;
   ResetElectionDeadline();
-  SendHeartbeats();
+  LOG(ERROR) << "[RAFT] node " << self_id_ << " becomes leader term="
+             << current_term_;
 }
 
 void RaftNode::SendHeartbeats() { BroadcastAppendEntries(/*send_all_entries=*/false); }
 
-void RaftNode::HeartbeatTick() { SendHeartbeats(); }
+void RaftNode::HeartbeatTick() {
+  // TODO: downgrade to INFO after debugging heartbeat delivery.
+  LOG(ERROR) << "[RAFT] node " << self_id_ << " heartbeat tick role="
+             << static_cast<int>(role_) << " term=" << current_term_
+             << " commit=" << commit_index_
+             << " last_log_index=" << raft_log_->LastLogIndex();
+  SendHeartbeats();
+}
 
 void RaftNode::BroadcastAppendEntries(bool send_all_entries) {
   std::unique_lock<std::mutex> lk(state_mutex_);
   if (role_ != Role::kLeader) {
+    LOG(ERROR) << "[RAFT] node " << self_id_
+               << " skipping BroadcastAppendEntries: not leader (role="
+               << static_cast<int>(role_) << ") term=" << current_term_;
     return;
   }
+  LOG(ERROR) << "[RAFT] Leader " << self_id_
+             << " broadcasting AppendEntries send_all_entries="
+             << (send_all_entries ? "true" : "false")
+             << " commit=" << commit_index_
+             << " last_log_index=" << raft_log_->LastLogIndex();
   uint64_t leader_commit = commit_index_;
   uint64_t current_term = current_term_;
   uint32_t leader_id = self_id_;
@@ -293,6 +373,14 @@ void RaftNode::BroadcastAppendEntries(bool send_all_entries) {
       if (!status.ok()) {
         LOG(ERROR) << "Failed to send AppendEntries to replica "
                    << replica.id() << ": " << status;
+      } else {
+        // TODO: downgrade to INFO once debugging is complete.
+        LOG(ERROR) << "[RAFT] Leader " << leader_id << " term " << current_term
+                   << " sent AppendEntries to " << replica.id()
+                   << " prev_idx=" << rpc.prev_log_index()
+                   << " prev_term=" << rpc.prev_log_term()
+                   << " entries=" << rpc.entries_size()
+                   << " leader_commit=" << rpc.leader_commit();
       }
     }
   }
@@ -374,6 +462,13 @@ void RaftNode::ApplyEntry(uint64_t index, const raft::LogEntry& entry) {
 
 int RaftNode::HandleAppendEntriesRequest(
     const Request& envelope, const raft::AppendEntriesRequest& request) {
+  // TODO: downgrade to INFO once debugging is complete.
+  LOG(ERROR) << "[RAFT] node " << self_id_ << " received AppendEntries from "
+             << envelope.sender_id() << " term=" << request.term()
+             << " prev_idx=" << request.prev_log_index()
+             << " prev_term=" << request.prev_log_term()
+             << " entries=" << request.entries_size()
+             << " leader_commit=" << request.leader_commit();
   std::lock_guard<std::mutex> lk(state_mutex_);
   if (request.term() < current_term_) {
     raft::AppendEntriesResponse response;
@@ -410,6 +505,17 @@ int RaftNode::HandleAppendEntriesRequest(
     response.set_conflict_index(prev_log_index == 0 ? 1 : prev_log_index);
   } else {
     response.set_success(true);
+    // Drop any conflicting suffix so the follower's log matches leader from
+    // prev_log_index onward before appending new entries.
+    uint64_t truncate_from = prev_log_index + 1;
+    if (truncate_from <= raft_log_->LastLogIndex()) {
+      absl::Status status = raft_log_->Truncate(truncate_from);
+      if (!status.ok()) {
+        LOG(ERROR) << "Failed to truncate follower log from " << truncate_from
+                   << ": " << status;
+        response.set_success(false);
+      }
+    }
     for (const auto& entry : request.entries()) {
       absl::Status status = raft_log_->Append({entry});
       if (!status.ok()) {
@@ -447,7 +553,13 @@ int RaftNode::HandleAppendEntriesResponse(
     const raft::AppendEntriesResponse& response) {
   std::unique_lock<std::mutex> lk(state_mutex_);
   if (response.term() > current_term_) {
-    BecomeFollower(response.term(), 0);
+    // Don't immediately demote on follower responses; trigger a new election
+    // in the higher term instead of stepping down mid-flight.
+    current_term_ = response.term();
+    voted_for_ = 0;
+    PersistTermAndVote();
+    lk.unlock();
+    StartElection();
     return 0;
   }
   if (role_ != Role::kLeader) {
@@ -469,15 +581,20 @@ int RaftNode::HandleRequestVoteRequest(
     const Request& envelope, const raft::RequestVoteRequest& request) {
   std::lock_guard<std::mutex> lk(state_mutex_);
   raft::RequestVoteResponse response;
-  response.set_term(current_term_);
   response.set_responder_id(self_id_);
 
   if (request.term() < current_term_) {
+    response.set_term(current_term_);
     response.set_vote_granted(false);
   } else {
     if (request.term() > current_term_) {
       BecomeFollower(request.term(), 0);
     }
+    // Reapply the term after possible step-down so we return the up-to-date
+    // term to candidates.
+    response.set_term(current_term_);
+    // If the term is equal, stay in our current role (candidate/follower) and
+    // evaluate the vote without forcing a step-down.
     bool voted = (voted_for_ == 0 || voted_for_ == request.candidate_id());
     bool log_ok = (request.last_log_term() > LastLogTerm()) ||
                   (request.last_log_term() == LastLogTerm() &&
@@ -491,6 +608,14 @@ int RaftNode::HandleRequestVoteRequest(
       response.set_vote_granted(false);
     }
   }
+  LOG(ERROR) << "[RAFT] node " << self_id_ << " vote response to "
+             << request.candidate_id() << " term=" << request.term()
+             << " current_term=" << current_term_
+             << " last_log_term=" << LastLogTerm()
+             << " last_log_index=" << raft_log_->LastLogIndex()
+             << " voted_for=" << voted_for_
+             << " log_ok=" << (response.vote_granted() ? "true" : "false")
+             << " granted=" << response.vote_granted();
 
   if (auto replica = ReplicaById(envelope.sender_id()); replica && raft_rpc_) {
     absl::Status status =
@@ -505,20 +630,59 @@ int RaftNode::HandleRequestVoteRequest(
 
 int RaftNode::HandleRequestVoteResponse(
     const raft::RequestVoteResponse& response) {
-  std::lock_guard<std::mutex> lk(state_mutex_);
+  std::unique_lock<std::mutex> lk(state_mutex_);
+  bool became_leader = false;
   if (response.term() > current_term_) {
     BecomeFollower(response.term(), 0);
+    LOG(ERROR) << "[RAFT] candidate " << self_id_
+               << " dropping vote from " << response.responder_id()
+               << " due to higher term response.term=" << response.term()
+               << " current_term=" << current_term_;
     return 0;
   }
-  if (role_ != Role::kCandidate || response.term() != current_term_) {
+  if (response.term() != current_term_) {
+    LOG(ERROR) << "[RAFT] candidate " << self_id_
+               << " dropping vote from " << response.responder_id()
+               << " due to stale term response.term=" << response.term()
+               << " current_term=" << current_term_;
     return 0;
   }
+  if (role_ != Role::kCandidate) {
+    LOG(ERROR) << "[RAFT] node " << self_id_
+               << " dropping vote from " << response.responder_id()
+               << " because role is not candidate (role="
+               << static_cast<int>(role_) << ")";
+    return 0;
+  }
+  // We heard from a peer during an active election; push out the deadline so
+  // the election isn't restarted mid-flight.
+  ResetElectionDeadline();
+  LOG(ERROR) << "[RAFT] candidate " << self_id_ << " got vote from "
+             << response.responder_id() << " term=" << response.term()
+             << " granted=" << response.vote_granted()
+             << " votes=" << votes_granted_ << "/"
+             << RequiredQuorum();
   if (response.vote_granted() && !vote_record_[response.responder_id()]) {
     vote_record_[response.responder_id()] = true;
     votes_granted_++;
+    LOG(ERROR) << "[RAFT] candidate " << self_id_ << " got vote from "
+               << response.responder_id() << " term=" << response.term()
+               << " granted=" << response.vote_granted()
+               << " votes=" << votes_granted_ << "/" << RequiredQuorum();
     if (votes_granted_ >= RequiredQuorum()) {
       BecomeLeader();
+      became_leader = true;
     }
+  } else {
+    LOG(ERROR) << "[RAFT] candidate " << self_id_ << " got vote from "
+               << response.responder_id() << " term=" << response.term()
+               << " granted=" << response.vote_granted()
+               << " votes=" << votes_granted_ << "/" << RequiredQuorum();
+  }
+  lk.unlock();
+  if (became_leader) {
+    // Send an immediate heartbeat after winning to demote others.
+    SendHeartbeats();
   }
   return 0;
 }
@@ -593,6 +757,10 @@ void RaftNode::PersistTermAndVote() {
   persistent_state_->SetVotedFor(voted_for_);
   if (auto status = persistent_state_->Store(); !status.ok()) {
     LOG(ERROR) << "Failed to persist term/vote state: " << status;
+  } else {
+    // TODO: downgrade to INFO once debugging is complete.
+    LOG(ERROR) << "[RAFT] node " << self_id_ << " persisted term="
+               << current_term_ << " voted_for=" << voted_for_;
   }
 }
 

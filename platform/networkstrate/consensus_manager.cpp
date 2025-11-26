@@ -349,8 +349,18 @@ void ConsensusManager::SendMessage(const google::protobuf::Message& message,
 
 std::unique_ptr<ReplicaCommunicator> ConsensusManager::GetReplicaClient(
     const std::vector<ReplicaInfo>& replicas, bool is_use_long_conn) {
+  // Filter out self to avoid echoing consensus RPCs back to the sender.
+  std::vector<ReplicaInfo> peers;
+  peers.reserve(replicas.size());
+  uint32_t self_id = config_.GetSelfInfo().id();
+  for (const auto& replica : replicas) {
+    if (replica.id() != self_id) {
+      peers.push_back(replica);
+    }
+  }
+
   return std::make_unique<ReplicaCommunicator>(
-      replicas,
+      peers,
       verifier_ == nullptr || config_.GetConfigData().not_need_signature()
           ? nullptr
           : verifier_.get(),

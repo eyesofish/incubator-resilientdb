@@ -38,11 +38,12 @@ void ShowUsage() {
 std::unique_ptr<Storage> NewStorage(const std::string& db_path,
                                     const ResConfigData& config_data) {
 #ifdef ENABLE_LEVELDB
-  LOG(INFO) << "use leveldb storage.";
-  return NewResLevelDB(db_path, config_data.leveldb_info());
-#endif
+  LOG(INFO) << "use leveldb storage at path: " << db_path;
+  return storage::NewResLevelDB(db_path, config_data.leveldb_info());
+#else
   LOG(INFO) << "use memory storage.";
-  return NewMemoryDB();
+  return storage::NewMemoryDB();
+#endif
 }
 
 int main(int argc, char** argv) {

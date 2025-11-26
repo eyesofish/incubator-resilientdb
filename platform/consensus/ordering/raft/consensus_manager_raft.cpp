@@ -39,7 +39,7 @@ ConsensusManagerRaft::ConsensusManagerRaft(
   Storage* storage =
       transaction_manager_ ? transaction_manager_->GetStorage() : nullptr;
   if (storage != nullptr) {
-    raft_log_ = std::make_unique<RaftLog>(storage);
+  raft_log_ = std::make_unique<RaftLog>(storage);
     auto status = raft_log_->LoadFromStorage();
     if (!status.ok()) {
       LOG(WARNING) << "Failed to load persisted RAFT log: " << status;
@@ -54,7 +54,11 @@ ConsensusManagerRaft::ConsensusManagerRaft(
     LOG(WARNING) << "Transaction manager storage unavailable; RAFT state will "
                     "not be persisted.";
   }
-  raft_rpc_ = std::make_unique<RaftRpc>(config_, GetBroadCastClient());
+  // Use short-connection ReplicaCommunicator for RAFT RPCs; more reliable for
+  // vote responses in this setup.
+  raft_rpc_client_ =
+      GetReplicaClient(config_.GetReplicaInfos(), /*is_use_long_conn=*/false);
+  raft_rpc_ = std::make_unique<RaftRpc>(config_, raft_rpc_client_.get());
 
   raft_node_ = std::make_unique<RaftNode>(
       config_, this, transaction_manager_.get(), raft_log_.get(),
@@ -91,16 +95,27 @@ int ConsensusManagerRaft::ConsensusCommit(std::unique_ptr<Context> context,
   switch (request->type()) {
     case Request::TYPE_CLIENT_REQUEST:
     case Request::TYPE_NEW_TXNS:
+      LOG(ERROR) << "[RAFT] Replica " << config_.GetSelfInfo().id()
+                << " received client request seq=" << request->seq()
+                << " type=" << request->type();
       return HandleClientRequest(std::move(context), std::move(request));
     case Request::TYPE_CUSTOM_QUERY:
       return HandleCustomQuery(std::move(context), std::move(request));
     case Request::TYPE_CUSTOM_CONSENSUS:
       return HandleCustomConsensus(std::move(context), std::move(request));
     default:
-      LOG(WARNING) << "ConsensusManagerRaft received unsupported request type: "
+      LOG(ERROR) << "ConsensusManagerRaft received unsupported request type: "
                    << request->type();
       return -1;
   }
+}
+
+int ConsensusManagerRaft::Dispatch(std::unique_ptr<Context> context,
+                                   std::unique_ptr<Request> request) {
+  if (request->type() == Request::TYPE_CUSTOM_CONSENSUS) {
+    return HandleCustomConsensus(std::move(context), std::move(request));
+  }
+  return ConsensusManager::Dispatch(std::move(context), std::move(request));
 }
 
 std::vector<ReplicaInfo> ConsensusManagerRaft::GetReplicas() {
@@ -137,6 +152,8 @@ void ConsensusManagerRaft::UpdateLeadership(uint32_t leader_id,
                                             uint64_t term) {
   leader_id_.store(leader_id);
   current_term_.store(term);
+  LOG(ERROR) << "[RAFT] Replica " << config_.GetSelfInfo().id()
+               << " recognizes leader " << leader_id << " for term " << term;
 }
 
 int ConsensusManagerRaft::HandleClientRequest(
@@ -144,7 +161,7 @@ int ConsensusManagerRaft::HandleClientRequest(
   if (client_request_handler_) {
     return client_request_handler_(std::move(context), std::move(request));
   }
-  LOG(WARNING) << "Client request arrived but RAFT core handler is not set yet.";
+  LOG(ERROR) << "Client request arrived but RAFT core handler is not set yet.";
   return -1;
 }
 
@@ -180,6 +197,9 @@ int ConsensusManagerRaft::HandleCustomConsensus(
                << request->user_type();
     return -1;
   }
+  LOG(ERROR) << "[RAFT] Replica " << config_.GetSelfInfo().id()
+             << " received RAFT custom message seq=" << request->seq()
+             << " type=" << request->user_type();
   if (consensus_message_handler_) {
     return consensus_message_handler_(std::move(context), std::move(request));
   }
@@ -214,7 +234,7 @@ void ConsensusManagerRaft::HeartbeatLoop() {
       heartbeat_task_();
     }
     lk.lock();
-    heartbeat_cv_.wait_for(lk, std::chrono::milliseconds(500), [this]() {
+    heartbeat_cv_.wait_for(lk, std::chrono::milliseconds(200), [this]() {
       return !heartbeat_running_;
     });
   }

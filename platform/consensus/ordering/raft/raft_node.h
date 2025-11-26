@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -128,6 +129,9 @@ class RaftNode {
 
   size_t votes_granted_ ABSL_GUARDED_BY(state_mutex_) = 0;
   std::unordered_map<uint32_t, bool> vote_record_ ABSL_GUARDED_BY(state_mutex_);
+  // Counts consecutive elections without stabilizing on a leader; used to
+  // widen election timeouts (backoff) and reduce collisions.
+  uint32_t election_backoff_steps_ ABSL_GUARDED_BY(election_mutex_) = 0;
 
   std::thread election_thread_;
   std::atomic<bool> stop_{false};
@@ -135,6 +139,9 @@ class RaftNode {
   std::condition_variable election_cv_;
   std::chrono::steady_clock::time_point next_election_deadline_
       ABSL_GUARDED_BY(election_mutex_);
+  std::mt19937 election_rng_ ABSL_GUARDED_BY(election_mutex_);
+  // Track role transitions for debugging/logging.
+  Role last_logged_role_ ABSL_GUARDED_BY(state_mutex_) = Role::kFollower;
 };
 
 }  // namespace resdb

@@ -62,26 +62,55 @@ absl::StatusOr<std::string> TransactionConstructor::GetResponseData(
 
 int TransactionConstructor::SendRequest(
     const google::protobuf::Message& message, Request::Type type) {
-  // Use the replica obtained from the server.
-  NetChannel::SetDestReplicaInfo(config_.GetReplicaInfos()[0]);
-  return NetChannel::SendRequest(message, type, false);
+  const auto& replicas = config_.GetReplicaInfos();
+  if (replicas.empty()) {
+    LOG(ERROR) << "client config contains no replicas";
+    return -1;
+  }
+  for (const auto& replica : replicas) {
+    NetChannel::SetDestReplicaInfo(replica);
+    int ret = NetChannel::SendRequest(message, type, false);
+    if (ret >= 0) {
+      return ret;
+    }
+    // Close the socket so the next attempt re-establishes a connection.
+    Close();
+    LOG(WARNING) << "send request to replica " << replica.id()
+                 << " failed, trying next replica";
+  }
+  return -1;
 }
 
 int TransactionConstructor::SendRequest(
     const google::protobuf::Message& message,
     google::protobuf::Message* response, Request::Type type) {
-  NetChannel::SetDestReplicaInfo(config_.GetReplicaInfos()[0]);
-  int ret = NetChannel::SendRequest(message, type, true);
-  if (ret == 0) {
-    std::string resp_str;
-    int ret = NetChannel::RecvRawMessageData(&resp_str);
-    if (ret >= 0) {
-      if (!response->ParseFromString(resp_str)) {
-        LOG(ERROR) << "parse response fail:" << resp_str.size();
-        return -2;
-      }
-      return 0;
+  const auto& replicas = config_.GetReplicaInfos();
+  if (replicas.empty()) {
+    LOG(ERROR) << "client config contains no replicas";
+    return -1;
+  }
+  for (const auto& replica : replicas) {
+    NetChannel::SetDestReplicaInfo(replica);
+    int ret = NetChannel::SendRequest(message, type, true);
+    if (ret < 0) {
+      Close();
+      LOG(WARNING) << "send request to replica " << replica.id()
+                   << " failed, trying next replica";
+      continue;
     }
+    std::string resp_str;
+    ret = NetChannel::RecvRawMessageData(&resp_str);
+    if (ret < 0) {
+      Close();
+      LOG(WARNING) << "recv response from replica " << replica.id()
+                   << " failed, trying next replica";
+      continue;
+    }
+    if (!response->ParseFromString(resp_str)) {
+      LOG(ERROR) << "parse response fail:" << resp_str.size();
+      return -2;
+    }
+    return 0;
   }
   return -1;
 }
