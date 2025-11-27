@@ -100,8 +100,10 @@ int ConsensusManagerRaft::ConsensusCommit(std::unique_ptr<Context> context,
     case Request::TYPE_CLIENT_REQUEST:
     case Request::TYPE_NEW_TXNS:
       LOG(ERROR) << "[RAFT] Replica " << config_.GetSelfInfo().id()
-                << " received client request seq=" << request->seq()
-                << " type=" << request->type();
+                 << " received client request seq=" << request->seq()
+                 << " user_seq=" << request->user_seq()
+                 << " type=" << request->type()
+                 << " payload_bytes=" << request->data().size();
       return HandleClientRequest(std::move(context), std::move(request));
     case Request::TYPE_CUSTOM_QUERY:
       return HandleCustomQuery(std::move(context), std::move(request));

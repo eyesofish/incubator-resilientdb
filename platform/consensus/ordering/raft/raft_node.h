@@ -79,7 +79,8 @@ class RaftNode {
   void BroadcastAppendEntries(bool send_all_entries);
   void MaybeAdvanceCommitIndex();
   void ApplyEntries();
-  void ApplyEntry(uint64_t index, const raft::LogEntry& entry);
+  std::unique_ptr<std::string> ApplyEntry(uint64_t index,
+                                          const raft::LogEntry& entry);
 
   int HandleAppendEntriesRequest(const Request& envelope,
                                  const raft::AppendEntriesRequest& request);

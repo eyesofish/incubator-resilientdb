@@ -111,7 +111,9 @@ absl::Status RaftLog::Append(const std::vector<raft::LogEntry>& entries) {
 }
 
 absl::Status RaftLog::Truncate(uint64_t index) {
-  if (index <= first_log_index_) {
+  // Raft allows prev_log_index to be 0; truncating from 1 is valid when the
+  // follower accepts entries that start at index 1.
+  if (index < first_log_index_) {
     return absl::InvalidArgumentError("cannot truncate before first index");
   }
   if (index > last_log_index_ + 1) {
