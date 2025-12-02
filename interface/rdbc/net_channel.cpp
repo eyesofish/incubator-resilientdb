@@ -61,6 +61,11 @@ void NetChannel::SetDestReplicaInfo(const ReplicaInfo& replica) {
   port_ = replica.port();
 }
 
+void NetChannel::SetMaxRetryCount(int max_retry_time) {
+  // At least one attempt per replica so we make forward progress.
+  max_retry_time_ = std::max(1, max_retry_time);
+}
+
 void NetChannel::IsLongConnection(bool long_connect_tion) {
   long_connect_tion_ = long_connect_tion;
 }
