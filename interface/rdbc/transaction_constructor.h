@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "absl/status/statusor.h"
 #include "interface/rdbc/net_channel.h"
 #include "platform/config/resdb_config.h"
@@ -41,11 +43,12 @@ class TransactionConstructor : public NetChannel {
                   Request::Type type = Request::TYPE_CLIENT_REQUEST);
 
  private:
-  absl::StatusOr<std::string> GetResponseData(const Response& response);
+ absl::StatusOr<std::string> GetResponseData(const Response& response);
 
  private:
   ResDBConfig config_;
   int64_t timeout_ms_;  // microsecond for timeout.
+  std::atomic<size_t> next_replica_index_{0};
 };
 
 }  // namespace resdb

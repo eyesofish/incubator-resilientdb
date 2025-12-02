@@ -60,6 +60,8 @@ class NetChannel {
   void SetSocket(std::unique_ptr<Socket> socket);
   void SetSignatureVerifier(SignatureVerifier* verifier);
   void SetDestReplicaInfo(const ReplicaInfo& replica);
+  // Configure how many attempts to make per replica before moving on.
+  void SetMaxRetryCount(int max_retry_time);
 
   // Send a message request to the server with a commend.
   // A new request will be generated with command cmd and contain the message.

@@ -20,6 +20,7 @@
 #include "interface/rdbc/transaction_constructor.h"
 
 #include <glog/logging.h>
+#include <set>
 
 namespace resdb {
 
@@ -29,6 +30,8 @@ TransactionConstructor::TransactionConstructor(const ResDBConfig& config)
       timeout_ms_(
           config.GetClientTimeoutMs()) {  // default 2s for process timeout
   socket_->SetRecvTimeout(timeout_ms_);
+  // Fail fast on a replica and move to the next one.
+  SetMaxRetryCount(1);
 }
 
 absl::StatusOr<std::string> TransactionConstructor::GetResponseData(
@@ -67,10 +70,17 @@ int TransactionConstructor::SendRequest(
     LOG(ERROR) << "client config contains no replicas";
     return -1;
   }
-  for (const auto& replica : replicas) {
+  const size_t replica_count = replicas.size();
+  size_t start_index = next_replica_index_.load();
+  if (start_index >= replica_count) {
+    start_index = 0;
+  }
+  for (size_t offset = 0; offset < replica_count; ++offset) {
+    const auto& replica = replicas[(start_index + offset) % replica_count];
     NetChannel::SetDestReplicaInfo(replica);
     int ret = NetChannel::SendRequest(message, type, false);
     if (ret >= 0) {
+      next_replica_index_.store((start_index + offset) % replica_count);
       return ret;
     }
     // Close the socket so the next attempt re-establishes a connection.
@@ -89,7 +99,13 @@ int TransactionConstructor::SendRequest(
     LOG(ERROR) << "client config contains no replicas";
     return -1;
   }
-  for (const auto& replica : replicas) {
+  const size_t replica_count = replicas.size();
+  size_t start_index = next_replica_index_.load();
+  if (start_index >= replica_count) {
+    start_index = 0;
+  }
+  for (size_t offset = 0; offset < replica_count; ++offset) {
+    const auto& replica = replicas[(start_index + offset) % replica_count];
     NetChannel::SetDestReplicaInfo(replica);
     int ret = NetChannel::SendRequest(message, type, true);
     if (ret < 0) {
@@ -110,6 +126,7 @@ int TransactionConstructor::SendRequest(
       LOG(ERROR) << "parse response fail:" << resp_str.size();
       return -2;
     }
+    next_replica_index_.store((start_index + offset) % replica_count);
     return 0;
   }
   return -1;
