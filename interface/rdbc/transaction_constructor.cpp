@@ -20,9 +20,30 @@
 #include "interface/rdbc/transaction_constructor.h"
 
 #include <glog/logging.h>
+#include <google/protobuf/descriptor.h>
 #include <set>
 
 namespace resdb {
+
+namespace {
+
+bool IsNotLeaderResponse(const google::protobuf::Message& response) {
+  const auto* descriptor = response.GetDescriptor();
+  const auto* reflection = response.GetReflection();
+  if (descriptor == nullptr || reflection == nullptr) {
+    return false;
+  }
+  const auto* value_field = descriptor->FindFieldByName("value");
+  if (value_field == nullptr ||
+      value_field->cpp_type() !=
+          google::protobuf::FieldDescriptor::CPPTYPE_STRING) {
+    return false;
+  }
+  const std::string value = reflection->GetString(response, value_field);
+  return value == "NOT_LEADER";
+}
+
+}  // namespace
 
 TransactionConstructor::TransactionConstructor(const ResDBConfig& config)
     : NetChannel("", 0),
@@ -125,6 +146,12 @@ int TransactionConstructor::SendRequest(
     if (!response->ParseFromString(resp_str)) {
       LOG(ERROR) << "parse response fail:" << resp_str.size();
       return -2;
+    }
+    if (IsNotLeaderResponse(*response)) {
+      Close();
+      LOG(WARNING) << "replica " << replica.id()
+                   << " is not leader, trying next replica";
+      continue;
     }
     next_replica_index_.store((start_index + offset) % replica_count);
     return 0;

@@ -33,7 +33,8 @@ int ResDBKVClient::Set(const std::string &key, const std::string &data) {
   request.set_cmd(KVRequest::SET);
   request.set_key(key);
   request.set_value(data);
-  return SendRequest(request);
+  KVResponse response;
+  return SendRequest(request, &response);
 }
 
 std::unique_ptr<std::string> ResDBKVClient::Get(const std::string &key) {

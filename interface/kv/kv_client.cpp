@@ -31,7 +31,8 @@ int KVClient::Set(const std::string& key, const std::string& data) {
   request.set_cmd(KVRequest::SET);
   request.set_key(key);
   request.set_value(data);
-  return SendRequest(request);
+  KVResponse response;
+  return SendRequest(request, &response);
 }
 
 std::unique_ptr<std::string> KVClient::Get(const std::string& key) {
@@ -81,7 +82,8 @@ int KVClient::Set(const std::string& key, const std::string& data,
   request.set_key(key);
   request.set_value(data);
   request.set_version(version);
-  return SendRequest(request);
+  KVResponse response;
+  return SendRequest(request, &response);
 }
 
 std::unique_ptr<ValueInfo> KVClient::Get(const std::string& key, int version) {
