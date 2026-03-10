@@ -139,6 +139,56 @@ absl::Status RaftLog::Truncate(uint64_t index) {
   return absl::OkStatus();
 }
 
+absl::Status RaftLog::CompactPrefix(uint64_t last_included_index) {
+  if (storage_ == nullptr) {
+    return absl::FailedPreconditionError("storage is null");
+  }
+  if (last_included_index == 0) {
+    return absl::OkStatus();
+  }
+  if (last_included_index + 1 < first_log_index_) {
+    return absl::OkStatus();
+  }
+
+  auto it = entries_.begin();
+  while (it != entries_.end() && it->first <= last_included_index) {
+    auto key = EncodeEntryKey(it->first);
+    if (!key.ok()) {
+      return key.status();
+    }
+    // No delete API is exposed by Storage. Clearing value prevents stale reloads
+    // when prefixes are compacted.
+    if (storage_->SetValue(*key, "") != 0) {
+      return absl::InternalError("failed to clear compacted log entry");
+    }
+    it = entries_.erase(it);
+  }
+
+  first_log_index_ = last_included_index + 1;
+  if (last_log_index_ < last_included_index) {
+    // Preserve monotonic last index even if all in-memory entries are compacted.
+    last_log_index_ = last_included_index;
+  }
+  if (commit_index_ < last_included_index) {
+    commit_index_ = last_included_index;
+  }
+
+  absl::Status status =
+      PersistIndex(state_prefix_ + kFirstIndexKey, first_log_index_);
+  if (!status.ok()) {
+    return status;
+  }
+  status = PersistIndex(state_prefix_ + kLastIndexKey, last_log_index_);
+  if (!status.ok()) {
+    return status;
+  }
+  status = PersistIndex(state_prefix_ + kCommitIndexKey, commit_index_);
+  if (!status.ok()) {
+    return status;
+  }
+  return absl::OkStatus();
+}
+
 absl::Status RaftLog::CommitTo(uint64_t index) {
   if (index > last_log_index_) {
     return absl::InvalidArgumentError("commit index beyond last log index");

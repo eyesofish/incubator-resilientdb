@@ -108,6 +108,7 @@ class ConsensusManagerRaft : public ConsensusManager {
   void StartHeartbeatThread();
   void StopHeartbeatThread();
   void HeartbeatLoop();
+  void HeartbeatWorkerLoop();
 
  private:
   std::unique_ptr<TransactionManager> transaction_manager_;
@@ -117,11 +118,14 @@ class ConsensusManagerRaft : public ConsensusManager {
   HeartbeatTask heartbeat_task_;
 
   std::thread raft_heartbeat_thread_;
+  std::thread heartbeat_worker_thread_;
   std::mutex heartbeat_mutex_;
   std::condition_variable heartbeat_cv_;
+  std::condition_variable heartbeat_worker_cv_;
+  bool heartbeat_task_pending_ = false;
   // Protects against re-entering a heartbeat send if the prior one blocks.
   std::atomic<bool> heartbeat_task_active_{false};
-  // Monotonic timestamp (ns) when the current heartbeat started, for watchdog.
+  // Monotonic timestamp (ns) when the current heartbeat started.
   std::atomic<uint64_t> heartbeat_inflight_started_ns_{0};
   std::atomic<bool> heartbeat_running_{false};
   std::atomic<uint32_t> leader_id_{0};

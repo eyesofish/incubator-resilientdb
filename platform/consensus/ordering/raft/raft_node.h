@@ -90,6 +90,8 @@ class RaftNode {
   int HandleRequestVoteResponse(const raft::RequestVoteResponse& response);
   int HandleInstallSnapshotRequest(const Request& envelope,
                                    const raft::InstallSnapshotRequest& request);
+  int HandleInstallSnapshotResponse(
+      const raft::InstallSnapshotResponse& response);
 
   std::optional<ReplicaInfo> ReplicaById(uint32_t node_id) const;
   uint64_t LastLogTerm() const;
@@ -130,6 +132,10 @@ class RaftNode {
 
   size_t votes_granted_ ABSL_GUARDED_BY(state_mutex_) = 0;
   std::unordered_map<uint32_t, bool> vote_record_ ABSL_GUARDED_BY(state_mutex_);
+  raft::SnapshotMetadata incoming_snapshot_metadata_
+      ABSL_GUARDED_BY(state_mutex_);
+  std::map<uint64_t, raft::SnapshotChunk> incoming_snapshot_chunks_
+      ABSL_GUARDED_BY(state_mutex_);
   // Counts consecutive elections without stabilizing on a leader; used to
   // widen election timeouts (backoff) and reduce collisions.
   uint32_t election_backoff_steps_ ABSL_GUARDED_BY(election_mutex_) = 0;

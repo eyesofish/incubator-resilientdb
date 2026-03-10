@@ -27,6 +27,7 @@ cc_library(
         "//common/utils",
         "//platform/config:resdb_config",
         "//platform/consensus/checkpoint",
+        "//platform/consensus/ordering/raft:raft_rpc_lib",
         "//platform/consensus/execution:system_info",
         "//platform/networkstrate:server_comm",
         "//platform/proto:resdb_cc_proto",
@@ -42,6 +43,7 @@ cc_test(
         "//chain/storage:mock_storage",
         "//common/test:test_main",
         "//platform/consensus/checkpoint:mock_checkpoint",
+        "//platform/consensus/ordering/raft:raft_rpc_lib",
         "//platform/consensus/ordering/common:transaction_utils",
     ],
 )

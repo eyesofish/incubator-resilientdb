@@ -39,6 +39,9 @@ class RaftLog {
   absl::Status LoadFromStorage();
   absl::Status Append(const std::vector<raft::LogEntry>& entries);
   absl::Status Truncate(uint64_t index);
+  // Discards entries up to last_included_index and advances first_log_index.
+  // Used when a snapshot supersedes a committed log prefix.
+  absl::Status CompactPrefix(uint64_t last_included_index);
   absl::Status CommitTo(uint64_t index);
 
   absl::StatusOr<raft::LogEntry> GetEntry(uint64_t index) const;

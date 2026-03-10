@@ -28,6 +28,7 @@
 #include <filesystem>
 
 #include "common/utils/utils.h"
+#include "platform/consensus/ordering/raft/raft_message_type.h"
 
 namespace resdb {
 
@@ -256,6 +257,11 @@ void Recovery::AddRequest(const Context* context, const Request* request) {
     case Request::TYPE_CHECKPOINT:
     case Request::TYPE_NEWVIEW:
       return WriteLog(context, request);
+    case Request::TYPE_CUSTOM_CONSENSUS:
+      if (raft::IsRaftUserType(request->user_type())) {
+        return WriteLog(context, request);
+      }
+      break;
     default:
       break;
   }

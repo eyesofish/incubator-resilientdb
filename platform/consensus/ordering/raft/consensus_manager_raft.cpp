@@ -151,6 +151,7 @@ void ConsensusManagerRaft::SetCustomConsensusHandler(RequestHandler handler) {
 }
 
 void ConsensusManagerRaft::SetHeartbeatTask(HeartbeatTask task) {
+  std::lock_guard<std::mutex> lk(heartbeat_mutex_);
   heartbeat_task_ = std::move(task);
 }
 
@@ -218,6 +219,12 @@ void ConsensusManagerRaft::StartHeartbeatThread() {
   if (!heartbeat_running_.compare_exchange_strong(expected, true)) {
     return;
   }
+  {
+    std::lock_guard<std::mutex> lk(heartbeat_mutex_);
+    heartbeat_task_pending_ = false;
+  }
+  heartbeat_worker_thread_ =
+      std::thread(&ConsensusManagerRaft::HeartbeatWorkerLoop, this);
   raft_heartbeat_thread_ =
       std::thread(&ConsensusManagerRaft::HeartbeatLoop, this);
 }
@@ -227,60 +234,64 @@ void ConsensusManagerRaft::StopHeartbeatThread() {
     return;
   }
   heartbeat_cv_.notify_all();
+  heartbeat_worker_cv_.notify_all();
   if (raft_heartbeat_thread_.joinable()) {
     raft_heartbeat_thread_.join();
   }
+  if (heartbeat_worker_thread_.joinable()) {
+    heartbeat_worker_thread_.join();
+  }
+  heartbeat_task_active_.store(false);
+  heartbeat_inflight_started_ns_.store(0, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lk(heartbeat_mutex_);
+  heartbeat_task_pending_ = false;
 }
 
 void ConsensusManagerRaft::HeartbeatLoop() {
   std::unique_lock<std::mutex> lk(heartbeat_mutex_);
   while (heartbeat_running_) {
-    lk.unlock();
     if (heartbeat_task_) {
-      // Run the heartbeat task in a fire-and-forget fashion so a blocked send
-      // does not stall the ticker thread. Skip if the previous heartbeat is
-      // still in flight.
-      bool expected = false;
-      if (heartbeat_task_active_.compare_exchange_strong(expected, true)) {
-        heartbeat_inflight_started_ns_.store(
-            absl::ToUnixNanos(absl::Now()), std::memory_order_relaxed);
-        std::thread([this]() {
-          try {
-            heartbeat_task_();
-          } catch (const std::exception& e) {
-            LOG(ERROR) << "[RAFT] heartbeat task threw exception: " << e.what();
-          } catch (...) {
-            LOG(ERROR) << "[RAFT] heartbeat task threw unknown exception";
-          }
-          heartbeat_inflight_started_ns_.store(0, std::memory_order_relaxed);
-          heartbeat_task_active_.store(false);
-        }).detach();
-      } else {
-        // Watchdog: if the in-flight heartbeat has taken too long, clear it so
-        // the ticker can continue.
-        uint64_t start_ns =
-            heartbeat_inflight_started_ns_.load(std::memory_order_relaxed);
-        uint64_t now_ns = absl::ToUnixNanos(absl::Now());
-        const uint64_t max_ns =
-            absl::ToInt64Nanoseconds(absl::Milliseconds(500));
-        if (start_ns > 0 && now_ns > start_ns &&
-            (now_ns - start_ns) > max_ns) {
-          LOG(ERROR)
-              << "[RAFT] heartbeat stuck for "
-              << (now_ns - start_ns) / 1000000
-              << "ms; clearing in-flight flag to continue ticks";
-          heartbeat_task_active_.store(false);
-          heartbeat_inflight_started_ns_.store(0, std::memory_order_relaxed);
-        } else {
-          LOG(ERROR)
-              << "[RAFT] skipping heartbeat: previous send still active";
-        }
-      }
+      heartbeat_task_pending_ = true;
+      heartbeat_worker_cv_.notify_one();
     }
-    lk.lock();
     heartbeat_cv_.wait_for(lk, std::chrono::milliseconds(200), [this]() {
       return !heartbeat_running_;
     });
+  }
+}
+
+void ConsensusManagerRaft::HeartbeatWorkerLoop() {
+  while (true) {
+    HeartbeatTask task;
+    {
+      std::unique_lock<std::mutex> lk(heartbeat_mutex_);
+      heartbeat_worker_cv_.wait(lk, [this]() {
+        return !heartbeat_running_ || heartbeat_task_pending_;
+      });
+      if (!heartbeat_running_ && !heartbeat_task_pending_) {
+        break;
+      }
+      if (!heartbeat_task_) {
+        heartbeat_task_pending_ = false;
+        continue;
+      }
+      task = heartbeat_task_;
+      heartbeat_task_pending_ = false;
+      heartbeat_task_active_.store(true);
+      heartbeat_inflight_started_ns_.store(
+          absl::ToUnixNanos(absl::Now()), std::memory_order_relaxed);
+    }
+
+    try {
+      task();
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[RAFT] heartbeat task threw exception: " << e.what();
+    } catch (...) {
+      LOG(ERROR) << "[RAFT] heartbeat task threw unknown exception";
+    }
+
+    heartbeat_inflight_started_ns_.store(0, std::memory_order_relaxed);
+    heartbeat_task_active_.store(false);
   }
 }
 

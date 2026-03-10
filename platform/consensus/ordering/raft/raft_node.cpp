@@ -37,7 +37,10 @@ namespace {
 // avoid premature timeouts on busy systems.
 constexpr std::chrono::milliseconds kMinElectionTimeout(12000);
 constexpr std::chrono::milliseconds kMaxElectionTimeout(20000);
-constexpr size_t kMaxEntriesPerAppend = 8;
+constexpr size_t kMaxEntriesPerHeartbeatAppend = 8;
+constexpr size_t kMaxEntriesPerCatchupAppend = 64;
+constexpr uint32_t kMaxElectionBackoffSteps = 8;
+constexpr std::chrono::milliseconds kElectionBackoffStep(500);
 }  // namespace
 
 RaftNode::RaftNode(const ResDBConfig& config, ConsensusManagerRaft* manager,
@@ -235,9 +238,13 @@ void RaftNode::ResetElectionDeadline() {
   auto span_ms =
       static_cast<int>(std::max<int64_t>((base_max - base_min).count(), 1));
   std::uniform_int_distribution<int> dist(0, span_ms);
+  const uint32_t backoff_steps =
+      std::min(election_backoff_steps_, kMaxElectionBackoffSteps);
+  const auto backoff_delay =
+      std::chrono::milliseconds(kElectionBackoffStep.count() * backoff_steps);
   next_election_deadline_ =
       std::chrono::steady_clock::now() + base_min +
-      std::chrono::milliseconds(dist(election_rng_));
+      std::chrono::milliseconds(dist(election_rng_)) + backoff_delay;
   election_cv_.notify_all();
 }
 
@@ -257,8 +264,15 @@ void RaftNode::StartElection() {
   vote_record_.clear();
   vote_record_[self_id_] = true;
   PersistTermAndVote();
+  uint32_t backoff_steps = 0;
+  {
+    std::lock_guard<std::mutex> el(election_mutex_);
+    election_backoff_steps_ =
+        std::min(election_backoff_steps_ + 1, kMaxElectionBackoffSteps);
+    backoff_steps = election_backoff_steps_;
+  }
   LOG(ERROR) << "[RAFT] node " << self_id_ << " starts election term="
-             << current_term_;
+             << current_term_ << " backoff_steps=" << backoff_steps;
 
   raft::RequestVoteRequest rpc;
   rpc.set_term(current_term_);
@@ -337,6 +351,10 @@ void RaftNode::BecomeLeader() {
   }
   match_index_[self_id_] = raft_log_->LastLogIndex();
   next_index_[self_id_] = next;
+  {
+    std::lock_guard<std::mutex> el(election_mutex_);
+    election_backoff_steps_ = 0;
+  }
   ResetElectionDeadline();
   LOG(ERROR) << "[RAFT] node " << self_id_ << " becomes leader term="
              << current_term_;
@@ -371,6 +389,9 @@ void RaftNode::BroadcastAppendEntries(bool send_all_entries) {
   uint32_t leader_id = self_id_;
   auto next_index = next_index_;
   auto last_log_index = raft_log_->LastLogIndex();
+  const size_t max_entries_per_append = send_all_entries
+                                            ? kMaxEntriesPerCatchupAppend
+                                            : kMaxEntriesPerHeartbeatAppend;
   // Release the state lock before doing network I/O so heartbeats are not
   // blocked by outbound sends.
   lk.unlock();
@@ -393,8 +414,9 @@ void RaftNode::BroadcastAppendEntries(bool send_all_entries) {
     // whether this is a heartbeat or an explicit broadcast.
     if (next_index[replica.id()] <= last_log_index) {
       uint64_t start = next_index[replica.id()];
-      uint64_t end = std::min(last_log_index,
-                              start + static_cast<uint64_t>(kMaxEntriesPerAppend) - 1);
+      uint64_t end =
+          std::min(last_log_index,
+                   start + static_cast<uint64_t>(max_entries_per_append) - 1);
       auto entries = raft_log_->GetEntries(start, end);
       if (entries.ok()) {
         for (const auto& entry : *entries) {
@@ -404,6 +426,7 @@ void RaftNode::BroadcastAppendEntries(bool send_all_entries) {
                    << " preparing AppendEntries to " << replica.id()
                    << " range=[" << start << "," << end << "]"
                    << " entries_added=" << rpc.entries_size()
+                   << " max_entries_per_append=" << max_entries_per_append
                    << " next_index=" << next_index[replica.id()]
                    << " last_log_index=" << last_log_index;
       }

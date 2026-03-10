@@ -62,6 +62,29 @@ TEST(RaftLogTest, TruncateDropsTail) {
   EXPECT_FALSE(missing.ok());
 }
 
+TEST(RaftLogTest, CompactPrefixDropsCommittedPrefix) {
+  auto storage = storage::NewMemoryDB();
+  RaftLog log(storage.get());
+  ASSERT_TRUE(log.Append({MakeEntry(1, 1), MakeEntry(2, 1), MakeEntry(3, 2),
+                          MakeEntry(4, 2), MakeEntry(5, 3)})
+                  .ok());
+  ASSERT_TRUE(log.CommitTo(4).ok());
+
+  ASSERT_TRUE(log.CompactPrefix(3).ok());
+  EXPECT_EQ(log.FirstLogIndex(), 4);
+  EXPECT_EQ(log.LastLogIndex(), 5);
+  EXPECT_EQ(log.CommitIndex(), 4);
+  EXPECT_FALSE(log.GetEntry(2).ok());
+  ASSERT_TRUE(log.GetEntry(4).ok());
+
+  RaftLog reloaded(storage.get());
+  ASSERT_TRUE(reloaded.LoadFromStorage().ok());
+  EXPECT_EQ(reloaded.FirstLogIndex(), 4);
+  EXPECT_EQ(reloaded.LastLogIndex(), 5);
+  EXPECT_EQ(reloaded.CommitIndex(), 4);
+  EXPECT_FALSE(reloaded.GetEntry(3).ok());
+  ASSERT_TRUE(reloaded.GetEntry(5).ok());
+}
+
 }  // namespace
 }  // namespace resdb
-

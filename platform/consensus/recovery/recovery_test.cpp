@@ -29,6 +29,7 @@
 #include "chain/storage/mock_storage.h"
 #include "common/test/test_macros.h"
 #include "platform/consensus/checkpoint/mock_checkpoint.h"
+#include "platform/consensus/ordering/raft/raft_message_type.h"
 #include "platform/consensus/ordering/common/transaction_utils.h"
 
 namespace resdb {
@@ -150,6 +151,43 @@ TEST_F(RecoveryTest, ReadLog_FlushOnce) {
     for (size_t i = 0; i < expected_types.size(); ++i) {
       EXPECT_EQ(list[i].type(), expected_types[i]);
     }
+  }
+}
+
+TEST_F(RecoveryTest, ReadLog_CustomConsensusRaft) {
+  {
+    Recovery recovery(config_, &checkpoint_, &system_info_, nullptr);
+
+    auto append_entries = NewRequest(Request::TYPE_CUSTOM_CONSENSUS, Request(), 0);
+    append_entries->set_seq(1);
+    append_entries->set_user_type(raft::RAFT_APPEND_ENTRIES_REQUEST);
+    recovery.AddRequest(nullptr, append_entries.get());
+
+    auto non_raft = NewRequest(Request::TYPE_CUSTOM_CONSENSUS, Request(), 0);
+    non_raft->set_seq(2);
+    non_raft->set_user_type(9999);
+    recovery.AddRequest(nullptr, non_raft.get());
+
+    auto vote_response = NewRequest(Request::TYPE_CUSTOM_CONSENSUS, Request(), 0);
+    vote_response->set_seq(3);
+    vote_response->set_user_type(raft::RAFT_REQUEST_VOTE_RESPONSE);
+    recovery.AddRequest(nullptr, vote_response.get());
+  }
+
+  {
+    std::vector<Request> list;
+    Recovery recovery(config_, &checkpoint_, &system_info_, nullptr);
+    recovery.ReadLogs(
+        [&](const SystemInfoData& data) {},
+        [&](std::unique_ptr<Context> context, std::unique_ptr<Request> request) {
+          list.push_back(*request);
+        });
+
+    ASSERT_EQ(list.size(), 2);
+    EXPECT_EQ(list[0].type(), Request::TYPE_CUSTOM_CONSENSUS);
+    EXPECT_EQ(list[0].user_type(), raft::RAFT_APPEND_ENTRIES_REQUEST);
+    EXPECT_EQ(list[1].type(), Request::TYPE_CUSTOM_CONSENSUS);
+    EXPECT_EQ(list[1].user_type(), raft::RAFT_REQUEST_VOTE_RESPONSE);
   }
 }
 
