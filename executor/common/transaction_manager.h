@@ -60,6 +60,12 @@ class TransactionManager {
 
   virtual Storage* GetStorage() { return storage_ ? storage_.get() : nullptr; }
 
+  // Snapshot hooks for Raft InstallSnapshot.
+  // Default no-op implementations let unrelated managers stay untouched.
+  // Returning empty bytes from DumpSnapshot signals "no snapshottable state".
+  virtual std::string DumpSnapshot() { return std::string(); }
+  virtual bool RestoreSnapshot(const std::string& /*snapshot*/) { return false; }
+
  protected:
   virtual std::unique_ptr<google::protobuf::Message> ParseData(
       const std::string& data);

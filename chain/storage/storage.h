@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -65,6 +66,17 @@ class Storage {
   virtual bool Flush(bool should_sync = false) { return true; };
 
   virtual uint64_t GetLastCheckpoint() { return 0; }
+
+  // Snapshot restore path: write a versioned item with the exact `version`
+  // bypassing the OCC version-increment check used by SetValueWithVersion.
+  // Default returns -1 so callers can detect unsupported back-ends.
+  virtual int SetItemDirectly(const std::string& key, const std::string& value,
+                              int version) {
+    (void)key;
+    (void)value;
+    (void)version;
+    return -1;
+  }
 
   void SetMaxHistoryNum(int num) { max_history_ = num; }
 

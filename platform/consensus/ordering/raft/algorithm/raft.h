@@ -90,6 +90,10 @@ struct RaftStatePatch {
 
 class Raft : public common::ProtocolBase {
  public:
+  // Callbacks supplied by the Consensus layer to bridge Raft<->TransactionManager.
+  using SnapshotDumpFunc = std::function<std::string()>;
+  using SnapshotRestoreFunc = std::function<bool(const std::string&)>;
+
   Raft(int id, int f, int total_num,
     SignatureVerifier* verifier,
     LeaderElectionManager* leaderelection_manager,
@@ -101,6 +105,11 @@ class Raft : public common::ProtocolBase {
   const bool replicationLoggingFlag_ = true;
   const bool livenessLoggingFlag_ = false;
 
+  void SetSnapshotCallbacks(SnapshotDumpFunc dump_func,
+                            SnapshotRestoreFunc restore_func);
+  // Leader: dump the state machine and persist a snapshot, then truncate
+  // the log prefix. Called from Consensus::OnCheckpointFinish.
+  virtual void TakeSnapshot(uint64_t last_applied_index);
   virtual bool ReceiveTransaction(std::unique_ptr<Request> req);
   virtual bool ReceiveAppendEntries(std::unique_ptr<AppendEntries> ae);
   virtual bool ReceiveAppendEntriesResponse(
@@ -110,6 +119,11 @@ class Raft : public common::ProtocolBase {
       std::unique_ptr<RequestVoteResponse> rvr);
   virtual void StartElection();
   virtual void SendHeartBeat();
+  virtual void SendInstallSnapshot(int followerId);
+  virtual bool ReceiveInstallSnapshot(
+      std::unique_ptr<InstallSnapshotRequest> request);
+  virtual bool ReceiveInstallSnapshotResponse(
+      std::unique_ptr<InstallSnapshotResponse> response);
   virtual Role GetRoleSnapshot() const;
   virtual void SetRole(Role role);
   virtual void PrintDebugStateLocked() const;
@@ -165,7 +179,6 @@ class Raft : public common::ProtocolBase {
 #ifdef RAFT_TEST_MODE
  private:
 #endif
-  void SendInstallSnapshot(int followerId);
   void TruncatePrefixLocked(uint64_t index);
   void SetRoleLocked(Role role);
 
@@ -209,6 +222,14 @@ class Raft : public common::ProtocolBase {
   //Stats* global_stats_;
   ReplicaCommunicator* replica_communicator_;
   RaftRecovery* recovery_;
+
+  // Snapshot chunk assembly on follower side.
+  InstallSnapshotRequest incoming_snapshot_meta_;  // Protected by mutex_
+  std::map<uint32_t, std::string> incoming_snapshot_chunks_;  // Protected by mutex_
+  // Snapshot I/O callbacks supplied by the Consensus layer.
+  SnapshotDumpFunc snapshot_dump_func_;
+  SnapshotRestoreFunc snapshot_restore_func_;
+  static constexpr size_t kSnapshotChunkSize = 65536;  // 64 KB
 
 #ifdef RAFT_TEST_MODE
  public:

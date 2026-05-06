@@ -83,6 +83,9 @@ class MemoryDB : public Storage {
   std::vector<std::pair<std::string, int>> GetTopHistory(const std::string& key,
                                                          int number) override;
 
+  int SetItemDirectly(const std::string& key, const std::string& value,
+                      int version) override;
+
  private:
   std::unordered_map<std::string, std::string> kv_map_;
   std::unordered_map<std::string, std::list<std::pair<std::string, int>>>

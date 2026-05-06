@@ -57,6 +57,14 @@ Consensus::Consensus(const ResDBConfig& config,
     leader_election_manager_->SetRaft(raft_.get());
     leader_election_manager_->MayStart();
 
+    raft_->SetSnapshotCallbacks(
+        [this]() -> std::string {
+          return transaction_executor_->DumpSnapshot();
+        },
+        [this](const std::string& data) -> bool {
+          return transaction_executor_->RestoreSnapshot(data);
+        });
+
     RecoverFromLogs();
 
     InitProtocol(raft_.get());
@@ -116,6 +124,26 @@ int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
     performance_manager_->SetPrimary(dtl->leaderid());
     return 0;
   }
+  else if (request->user_type() == MessageType::InstallSnapshotMsg) {
+    std::unique_ptr<InstallSnapshotRequest> req =
+        std::make_unique<InstallSnapshotRequest>();
+    if (!req->ParseFromString(request->data())) {
+      LOG(ERROR) << "parse InstallSnapshot fail";
+      return -1;
+    }
+    raft_->ReceiveInstallSnapshot(std::move(req));
+    return 0;
+  }
+  else if (request->user_type() == MessageType::InstallSnapshotResponseMsg) {
+    std::unique_ptr<InstallSnapshotResponse> resp =
+        std::make_unique<InstallSnapshotResponse>();
+    if (!resp->ParseFromString(request->data())) {
+      LOG(ERROR) << "parse InstallSnapshotResponse fail";
+      return -1;
+    }
+    raft_->ReceiveInstallSnapshotResponse(std::move(resp));
+    return 0;
+  }
   LOG(ERROR) << "Unknown message type";
   return 0;
 }
@@ -148,6 +176,15 @@ void Consensus::RecoverFromLogs() {
         }
       },
       [](int) {});
+
+  // Restore snapshot data if the metadata indicates one was persisted.
+  uint64_t snap_last_index = raft_->GetSnapshotLastIndex();
+  if (snap_last_index > 0) {
+    std::string snap_data = recovery_->ReadSnapshotData();
+    if (!snap_data.empty()) {
+      transaction_executor_->RestoreSnapshot(snap_data);
+    }
+  }
 }
 
 int Consensus::ProcessNewTransaction(std::unique_ptr<Request> request) {
@@ -185,7 +222,7 @@ int Consensus::ResponseMsg(const BatchUserResponse& batch_resp) {
 
 void Consensus::OnCheckpointFinish(uint64_t seq) {
   LOG(INFO) << "Checkpointed all entries up to " << seq;
-  // raft_->TruncatePrefix(seq);
+  raft_->TakeSnapshot(seq);
 }
 
 }  // namespace raft

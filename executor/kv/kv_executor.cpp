@@ -220,5 +220,41 @@ std::string KVExecutor::ExecuteSQL(const std::string& sql_query) {
   return storage_->ExecuteSQL(sql_query);
 }
 
+std::string KVExecutor::DumpSnapshot() {
+  if (storage_ == nullptr) {
+    return std::string();
+  }
+  const auto items = storage_->GetAllItems();
+  Items proto;
+  for (const auto& kv : items) {
+    Item* item = proto.add_item();
+    item->set_key(kv.first);
+    item->mutable_value_info()->set_value(kv.second.first);
+    item->mutable_value_info()->set_version(kv.second.second);
+  }
+  return proto.SerializeAsString();
+}
+
+bool KVExecutor::RestoreSnapshot(const std::string& snapshot) {
+  if (storage_ == nullptr) {
+    return false;
+  }
+  Items proto;
+  if (!snapshot.empty() && !proto.ParseFromString(snapshot)) {
+    LOG(ERROR) << "RestoreSnapshot: failed to parse snapshot payload";
+    return false;
+  }
+  for (const auto& item : proto.item()) {
+    int rc = storage_->SetItemDirectly(
+        item.key(), item.value_info().value(), item.value_info().version());
+    if (rc != 0) {
+      LOG(ERROR) << "RestoreSnapshot: storage rejected key=" << item.key()
+                 << " rc=" << rc;
+      return false;
+    }
+  }
+  return true;
+}
+
 
 }  // namespace resdb

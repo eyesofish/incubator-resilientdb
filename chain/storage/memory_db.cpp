@@ -201,5 +201,14 @@ std::vector<std::pair<std::string, int>> MemoryDB::GetTopHistory(
   return resp;
 }
 
+int MemoryDB::SetItemDirectly(const std::string& key,
+                              const std::string& value, int version) {
+  kv_map_with_v_[key].push_back(std::make_pair(value, version));
+  while (kv_map_with_v_[key].size() > max_history_) {
+    kv_map_with_v_[key].erase(kv_map_with_v_[key].begin());
+  }
+  return 0;
+}
+
 }  // namespace storage
 }  // namespace resdb

@@ -58,6 +58,9 @@ class KVExecutor : public TransactionManager {
   void GetTopHistory(const std::string& key, int top_number, Items* items);
   std::string ExecuteSQL(const std::string& sql_query);
 
+  std::string DumpSnapshot() override;
+  bool RestoreSnapshot(const std::string& snapshot) override;
+
  private:
   std::unique_ptr<TransactionManager> contract_manager_;
 };

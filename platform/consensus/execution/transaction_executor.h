@@ -67,6 +67,15 @@ class TransactionExecutor {
 
   Storage* GetStorage();
 
+  std::string DumpSnapshot() {
+    return transaction_manager_ ? transaction_manager_->DumpSnapshot()
+                                : std::string();
+  }
+  bool RestoreSnapshot(const std::string& data) {
+    return transaction_manager_ ? transaction_manager_->RestoreSnapshot(data)
+                                : false;
+  }
+
   void RegisterExecute(int64_t seq);
   void WaitForExecute(int64_t seq);
   void FinishExecute(int64_t seq);

@@ -56,6 +56,8 @@ void RaftRecovery::Init() {
 
   meta_file_path_ = std::filesystem::path(base_file_path_).parent_path() /
                     "raft_metadata.dat";
+  snapshot_file_path_ = std::filesystem::path(base_file_path_).parent_path() /
+                        "raft_snapshot.dat";
   LOG(INFO) << "Meta file path: " << meta_file_path_;
   OpenMetadataFile();
 
@@ -311,6 +313,114 @@ void RaftRecovery::HandleSystemInfo(
   LOG(ERROR) << " metadata_.voted_for: " << metadata_.voted_for
              << "\nmetadata_.current_term " << metadata_.current_term;
   system_callback(metadata_);
+}
+
+void RaftRecovery::WriteSnapshotData(const std::string& data,
+                                     uint64_t last_included_index,
+                                     uint64_t last_included_term) {
+  if (recovery_enabled_ == false) {
+    return;
+  }
+
+  std::string tmp_path = snapshot_file_path_ + ".tmp";
+  int fd = open(tmp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+  if (fd < 0) {
+    LOG(ERROR) << "Failed to create snapshot tmp file: " << strerror(errno);
+    return;
+  }
+
+  struct {
+    char magic[4];
+    uint64_t index;
+    uint64_t term;
+    uint64_t size;
+  } header;
+  memcpy(header.magic, "RSFT", 4);
+  header.index = last_included_index;
+  header.term = last_included_term;
+  header.size = data.size();
+
+  if (write(fd, &header, sizeof(header)) != sizeof(header)) {
+    LOG(ERROR) << "Failed to write snapshot header: " << strerror(errno);
+    close(fd);
+    unlink(tmp_path.c_str());
+    return;
+  }
+  if (write(fd, data.data(), data.size()) != static_cast<ssize_t>(data.size())) {
+    LOG(ERROR) << "Failed to write snapshot data: " << strerror(errno);
+    close(fd);
+    unlink(tmp_path.c_str());
+    return;
+  }
+  if (fsync(fd) < 0) {
+    LOG(ERROR) << "Failed to fsync snapshot tmp file: " << strerror(errno);
+    close(fd);
+    unlink(tmp_path.c_str());
+    return;
+  }
+  close(fd);
+
+  if (rename(tmp_path.c_str(), snapshot_file_path_.c_str()) < 0) {
+    LOG(ERROR) << "Failed to rename snapshot tmp file: " << strerror(errno);
+    unlink(tmp_path.c_str());
+    return;
+  }
+
+  std::string dir_path =
+      std::filesystem::path(snapshot_file_path_).parent_path().string();
+  int dir_fd = open(dir_path.c_str(), O_RDONLY);
+  if (dir_fd >= 0) {
+    fsync(dir_fd);
+    close(dir_fd);
+  }
+
+  LOG(INFO) << "Wrote snapshot data: index=" << last_included_index
+            << " term=" << last_included_term
+            << " size=" << data.size();
+}
+
+std::string RaftRecovery::ReadSnapshotData() {
+  if (recovery_enabled_ == false) {
+    return "";
+  }
+
+  int fd = open(snapshot_file_path_.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return "";
+  }
+
+  struct {
+    char magic[4];
+    uint64_t index;
+    uint64_t term;
+    uint64_t size;
+  } header;
+  if (read(fd, &header, sizeof(header)) != sizeof(header) ||
+      memcmp(header.magic, "RSFT", 4) != 0) {
+    LOG(ERROR) << "Invalid snapshot file header";
+    close(fd);
+    return "";
+  }
+  if (header.size == 0) {
+    close(fd);
+    return "";
+  }
+
+  std::string data(header.size, '\0');
+  if (read(fd, data.data(), header.size) != static_cast<ssize_t>(header.size)) {
+    LOG(ERROR) << "Failed to read snapshot data: " << strerror(errno);
+    close(fd);
+    return "";
+  }
+  close(fd);
+  return data;
+}
+
+void RaftRecovery::ClearSnapshotData() {
+  if (recovery_enabled_ == false) {
+    return;
+  }
+  unlink(snapshot_file_path_.c_str());
 }
 
 }  // namespace raft

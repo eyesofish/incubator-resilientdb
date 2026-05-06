@@ -59,15 +59,23 @@ class RaftRecovery
   void AddLogEntry(const Entry* entry, int64_t seq);
   void AddLogEntry(std::vector<Entry>& entries_to_add, int64_t seq);
   void TruncateLog(TruncationRecord truncate_beginning_at);
+  virtual void WriteSnapshotData(const std::string& data,
+                                  uint64_t last_included_index,
+                                  uint64_t last_included_term);
+  virtual std::string ReadSnapshotData();
+  virtual void ClearSnapshotData();
 
 #ifdef RAFT_RECOVERY_TEST_MODE
   std::string GetMetadataFilePath() { return meta_file_path_; }
 
   std::string GetFilePath() { return file_path_; }
+
+  std::string GetSnapshotFilePath() { return snapshot_file_path_; }
 #endif
 
  private:
   void OpenMetadataFile();
+  void OpenSnapshotFile();
   void WriteSystemInfo();
   std::vector<std::unique_ptr<WALRecord>> ParseDataListItem(
       std::vector<std::string>& data_list);
@@ -83,6 +91,7 @@ class RaftRecovery
 
   int metadata_fd_;
   std::string meta_file_path_;
+  std::string snapshot_file_path_;
   RaftMetadata metadata_;
 };
 

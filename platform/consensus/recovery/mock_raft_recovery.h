@@ -41,6 +41,12 @@ class MockRaftRecovery : public RaftRecovery {
               ());
   MOCK_METHOD(void, AddLogEntry, (std::vector<Entry>& entries_to_add), ());
   MOCK_METHOD(void, TruncateLog, (TruncationRecord truncate_beginning_at), ());
+  MOCK_METHOD(void, WriteSnapshotData,
+              (const std::string& data, uint64_t last_included_index,
+               uint64_t last_included_term),
+              ());
+  MOCK_METHOD(std::string, ReadSnapshotData, (), ());
+  MOCK_METHOD(void, ClearSnapshotData, (), ());
 
   std::unique_ptr<MockCheckPoint> mock_checkpoint_;
   std::unique_ptr<MockStorage> mock_storage_;

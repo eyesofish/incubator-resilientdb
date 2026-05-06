@@ -56,8 +56,9 @@ def nexres_repositories():
     maybe(
         http_archive,
         name = "com_google_absl",
-        strip_prefix = "abseil-cpp-20211102.0",
-        urls = ["https://github.com/abseil/abseil-cpp/archive/refs/tags/20211102.0.zip"],
+        sha256 = "69909dd729932cbbabb9eeaff56179e8d124515f5d3ac906663d573d700b4c7d",
+        strip_prefix = "abseil-cpp-20240116.2",
+        urls = ["https://github.com/abseil/abseil-cpp/archive/refs/tags/20240116.2.zip"],
     )
     maybe(
         http_archive,

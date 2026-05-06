@@ -1025,17 +1025,250 @@ void Raft::TruncatePrefixLocked(uint64_t index) {
   assert(lastLogIndex_ == GetLogicalLogSize() - 1);
 }
 
-void Raft::SendInstallSnapshot(int followerId) {}
-
-/*
-void Raft::ReceiveInstallSnapshot() {
-
+void Raft::SetSnapshotCallbacks(SnapshotDumpFunc dump_func,
+                                SnapshotRestoreFunc restore_func) {
+  snapshot_dump_func_ = std::move(dump_func);
+  snapshot_restore_func_ = std::move(restore_func);
 }
 
-void Raft::ReceiveInstallSnapshotResponse() {
+void Raft::TakeSnapshot(uint64_t last_applied_index) {
+  if (!snapshot_dump_func_) return;
 
+  std::string payload = snapshot_dump_func_();
+  if (payload.empty()) {
+    LOG(WARNING) << "Snapshot dump returned empty payload at index "
+                 << last_applied_index;
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (last_applied_index <= static_cast<uint64_t>(snapshot_last_index_))
+      return;
+  }
+
+  uint64_t last_included_term;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    last_included_term = GetLogTermAtIndex(last_applied_index);
+  }
+
+  LOG(INFO) << "Taking snapshot at index " << last_applied_index
+            << " term " << last_included_term
+            << " payload size " << payload.size();
+
+  recovery_->WriteSnapshotData(payload, last_applied_index,
+                                last_included_term);
+
+  TruncatePrefix(last_applied_index);
 }
-*/
+
+void Raft::SendInstallSnapshot(int followerId) {
+  if (replicationLoggingFlag_) {
+    LOG(INFO) << "Sending InstallSnapshot to follower " << followerId;
+  }
+
+  std::string snapshot_data = recovery_->ReadSnapshotData();
+  if (snapshot_data.empty()) {
+    LOG(WARNING) << "No snapshot data available to send to follower "
+                 << followerId;
+    return;
+  }
+
+  uint64_t snap_index, snap_term, current_term;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    snap_index = snapshot_last_index_;
+    snap_term = snapshot_last_term_;
+    current_term = currentTerm_;
+  }
+
+  std::string state_hash = SignatureVerifier::CalculateHash(snapshot_data);
+
+  size_t offset = 0;
+  uint32_t chunk_index = 0;
+  while (offset < snapshot_data.size()) {
+    size_t chunk_len =
+        std::min(kSnapshotChunkSize, snapshot_data.size() - offset);
+    bool last_chunk = (offset + chunk_len >= snapshot_data.size());
+
+    InstallSnapshotRequest req;
+    req.set_term(current_term);
+    req.set_leader_id(id_);
+    req.set_last_included_index(snap_index);
+    req.set_last_included_term(snap_term);
+    req.set_chunk_index(chunk_index);
+    req.set_data(snapshot_data.substr(offset, chunk_len));
+    req.set_last_chunk(last_chunk);
+    req.set_state_hash(state_hash);
+
+    SendMessage(MessageType::InstallSnapshotMsg, req, followerId);
+
+    offset += chunk_len;
+    chunk_index++;
+  }
+
+  if (replicationLoggingFlag_) {
+    LOG(INFO) << "Sent " << chunk_index << " snapshot chunks to follower "
+              << followerId;
+  }
+}
+
+bool Raft::ReceiveInstallSnapshot(
+    std::unique_ptr<InstallSnapshotRequest> request) {
+  std::lock_guard<std::mutex> lk(mutex_);
+
+  InstallSnapshotResponse resp;
+  resp.set_responder_id(id_);
+
+  // Stale leader reject.
+  if (request->term() < currentTerm_) {
+    resp.set_term(currentTerm_);
+    resp.set_success(false);
+    resp.set_applied_index(snapshot_last_index_);
+    SendMessage(MessageType::InstallSnapshotResponseMsg, resp,
+                request->leader_id());
+    return true;
+  }
+
+  // Accept new term.
+  if (request->term() > currentTerm_) {
+    DemoteSelfLocked(request->term());
+  }
+  resp.set_term(currentTerm_);
+
+  // Idempotent: already have this snapshot or newer.
+  if (request->last_included_index() <=
+      static_cast<uint64_t>(snapshot_last_index_)) {
+    resp.set_success(true);
+    resp.set_applied_index(snapshot_last_index_);
+    SendMessage(MessageType::InstallSnapshotResponseMsg, resp,
+                request->leader_id());
+    return true;
+  }
+
+  // New snapshot: reset accumulation if metadata changed.
+  if (incoming_snapshot_meta_.last_included_index() !=
+      request->last_included_index()) {
+    incoming_snapshot_chunks_.clear();
+    incoming_snapshot_meta_ = *request;
+  }
+
+  // Accumulate chunk.
+  incoming_snapshot_chunks_[request->chunk_index()] = request->data();
+
+  // Acknowledge partial but don't apply yet.
+  if (!request->last_chunk()) {
+    resp.set_success(true);
+    resp.set_applied_index(snapshot_last_index_);
+    SendMessage(MessageType::InstallSnapshotResponseMsg, resp,
+                request->leader_id());
+    return true;
+  }
+
+  // Last chunk: assemble, verify hash, apply.
+  std::string assembled;
+  for (uint32_t i = 0; i <= request->chunk_index(); ++i) {
+    auto it = incoming_snapshot_chunks_.find(i);
+    if (it == incoming_snapshot_chunks_.end()) {
+      LOG(ERROR) << "Missing chunk " << i << " in snapshot assembly";
+      resp.set_success(false);
+      resp.set_applied_index(snapshot_last_index_);
+      SendMessage(MessageType::InstallSnapshotResponseMsg, resp,
+                  request->leader_id());
+      incoming_snapshot_chunks_.clear();
+      return true;
+    }
+    assembled += it->second;
+  }
+
+  // Hash verification.
+  if (!request->state_hash().empty() &&
+      request->state_hash() != SignatureVerifier::CalculateHash(assembled)) {
+    LOG(ERROR) << "Snapshot hash mismatch at index "
+               << request->last_included_index();
+    resp.set_success(false);
+    resp.set_applied_index(snapshot_last_index_);
+    SendMessage(MessageType::InstallSnapshotResponseMsg, resp,
+                request->leader_id());
+    incoming_snapshot_chunks_.clear();
+    return true;
+  }
+
+  // Apply snapshot.
+  bool restored = true;
+  if (snapshot_restore_func_) {
+    restored = snapshot_restore_func_(assembled);
+  }
+  if (!restored) {
+    LOG(ERROR) << "Failed to restore snapshot at index "
+               << request->last_included_index();
+    resp.set_success(false);
+    resp.set_applied_index(snapshot_last_index_);
+    SendMessage(MessageType::InstallSnapshotResponseMsg, resp,
+                request->leader_id());
+    incoming_snapshot_chunks_.clear();
+    return true;
+  }
+
+  // Persist snapshot data for future restarts.
+  recovery_->WriteSnapshotData(assembled, request->last_included_index(),
+                                request->last_included_term());
+
+  // Update local state.
+  SetSnapshotLastIndexAndTerm(request->last_included_index(),
+                               request->last_included_term(), true);
+  if (commitIndex_ < request->last_included_index()) {
+    commitIndex_ = request->last_included_index();
+  }
+  if (lastCommitted_ < request->last_included_index()) {
+    lastCommitted_ = request->last_included_index();
+  }
+
+  incoming_snapshot_chunks_.clear();
+  incoming_snapshot_meta_.Clear();
+
+  resp.set_success(true);
+  resp.set_applied_index(request->last_included_index());
+  SendMessage(MessageType::InstallSnapshotResponseMsg, resp,
+              request->leader_id());
+
+  LOG(INFO) << "Installed snapshot at index " << request->last_included_index();
+  return true;
+}
+
+bool Raft::ReceiveInstallSnapshotResponse(
+    std::unique_ptr<InstallSnapshotResponse> response) {
+  std::lock_guard<std::mutex> lk(mutex_);
+
+  if (response->term() > currentTerm_) {
+    DemoteSelfLocked(response->term());
+    leader_election_manager_->OnRoleChange();
+    return false;
+  }
+
+  if (role_ != Role::LEADER || response->term() < currentTerm_) {
+    return true;
+  }
+
+  if (!response->success()) {
+    LOG(WARNING) << "Follower " << response->responder_id()
+                 << " rejected InstallSnapshot, will retry";
+    return true;
+  }
+
+  int followerId = response->responder_id();
+  uint64_t applied = response->applied_index();
+  if (nextIndex_[followerId] < applied + 1) {
+    nextIndex_[followerId] = applied + 1;
+  }
+  if (matchIndex_[followerId] < applied) {
+    matchIndex_[followerId] = applied;
+  }
+
+  LOG(INFO) << "Follower " << followerId << " applied snapshot at " << applied;
+  return true;
+}
 
 void Raft::PrintDebugStateLocked() const {
   std::lock_guard<std::mutex> lk(mutex_);
