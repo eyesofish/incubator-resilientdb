@@ -1,3 +1,25 @@
+> **Fork note — Raft consensus layer (Yang Yu, UC Davis, Sep–Nov 2025)**
+>
+> This repo is my working tree for adding a **Raft consensus layer** to ResilientDB as an alternative to the existing PBFT path. Upstream is unmodified; my changes live alongside it on `master`.
+>
+> **What I added**
+> - Consensus protocol switching infrastructure so the kernel can boot under either PBFT or Raft (commit `111387d`).
+> - `ConsensusManagerRaft` skeleton, kernel components, and storage isolation (commits `1bd1625`, `e4effee`).
+> - Leader election, heartbeat handling, log replication, commit flow, and state-machine application — exercising core fault-tolerant distributed-systems behaviour.
+> - `RaftLog`, `PersistentState`, and `SnapshotManager` for crash recovery and state consistency.
+> - Lock-contention and client-redirect fixes scoped to the Raft path (commits `ebf5992`, `b445fd2`).
+>
+> **Code-path entry points** (start here if you're reading the diff):
+> - `service/utils/server_factory.h` — protocol switch wiring (commit `2fd72f5`)
+> - `platform/consensus/ordering/raft/` — Raft layer (added in `e4effee`, `1bd1625`)
+> - `platform/proto/` — RPC message additions
+>
+> **Commit window**: 2025-10-27 → 2025-12-03 (15 commits, all on `master`).
+>
+> Upstream project: https://github.com/apache/incubator-resilientdb
+>
+> ---
+
 <!--
  Licensed to the Apache Software Foundation (ASF) under one
  or more contributor license agreements.  See the NOTICE file
